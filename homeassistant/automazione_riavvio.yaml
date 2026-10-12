@@ -1,0 +1,32 @@
+# Automazione Home Assistant (alternativa al flow Node-RED in nodered/).
+# Avvisa quando la centralina si riavvia (es. dopo un blackout) per ricordarsi
+# di confermare data e ora sul display della MTDC.
+# Verifica l'entity_id effettivo del sensore "Ultimo riavvio centralina".
+
+alias: "Sorel MTDC riavviata: confermare data e ora"
+description: "Notifica quando la centralina solare si riavvia"
+mode: single
+triggers:
+  - trigger: state
+    entity_id: sensor.sorel_mtdc_ultimo_riavvio_centralina
+conditions:
+  # evita notifiche al riavvio di Home Assistant o dell'ESP
+  - condition: template
+    value_template: >
+      {{ trigger.from_state is not none
+         and trigger.from_state.state not in ['unknown', 'unavailable']
+         and trigger.to_state.state not in ['unknown', 'unavailable'] }}
+actions:
+  - action: persistent_notification.create
+    data:
+      notification_id: sorel_mtdc_riavvio
+      title: "Centralina solare riavviata"
+      message: >
+        La centralina Sorel MTDC si è riavviata il
+        {{ as_timestamp(trigger.to_state.state) | timestamp_custom('%d/%m/%Y %H:%M') }}
+        (probabile blackout). Conferma data e ora sul display.
+  # Per una notifica sul telefono aggiungi, ad esempio:
+  # - action: notify.mobile_app_<il_tuo_telefono>
+  #   data:
+  #     title: "Centralina solare riavviata"
+  #     message: "Conferma data e ora sul display della MTDC."

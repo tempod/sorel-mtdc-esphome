@@ -1,0 +1,573 @@
+# =============================================================================
+#  sorel-mtdc-esphome
+#  Lettura della centralina solare SOREL MTDC (v5) via bus CAN con ESPHome
+#
+#  Hardware : NodeMCU v3 / Wemos D1 mini (ESP8266) + modulo MCP2515 (quarzo 8 MHz)
+#  Testato  : ESPHome 2026.9.1, Home Assistant 2026.10, MTDC v5 con programma S10
+#  Licenza  : MIT (vedi LICENSE)
+#  Progetto : https://github.com/tempod/sorel-mtdc-esphome
+#
+#  SOLA LETTURA: l'ESP non trasmette nulla, ascolta e conferma (ACK) i frame
+#  che la centralina invia da sola. Nessun parametro della centralina viene toccato.
+#
+#  ---------------------------------------------------------------------------
+#  COLLEGAMENTI (dettagli in docs/HARDWARE.md)
+#    NodeMCU VU(5V) -> VCC   G -> GND   D5 -> SCK   D7 -> SI   D6 -> SO   D8 -> CS
+#    MCP2515 H / L  -> CAN-H / CAN-L della centralina (presa CAN1 o CAN2)
+#    Terminazione: 120 ohm su ENTRAMBI i capi del bus (ponticello J1 sul modulo
+#    + 120 ohm lato centralina). A tutto spento tra H e L si devono misurare ~60 ohm.
+#
+#  ---------------------------------------------------------------------------
+#  PROTOCOLLO SCBI in breve (dettagli e frame reali in docs/PROTOCOLLO.md)
+#    CAN 250 kbit/s, ID esteso 29 bit
+#    ID little-endian: byte0 = prog, byte1 = client (ID centralina, qui 0x97),
+#                      byte2 = func, byte3 = 0x10 (risposta)
+#    prog 0x80
+#      func 0x01 sonde       [id][int16 LE /10 °C]   id 0-3 = S1-S4
+#                            (id 4 = potenza come sonda virtuale, ignorata)
+#                            inviate a ogni cambio (max 1 ogni 10 s) e comunque ogni ~5 min
+#      func 0x02 rele'       [id][modo][valore]      id 0 = R1, 1 = R2, 2 = uscita PWM pompa
+#      func 0x03 programma   testo ASCII, es. "S10"  (solo all'accensione, non sempre)
+#      func 0x04 messaggi    [codice ...] poi [FE testo ASCII], es. "Riavvio"
+#      func 0x06 statistica  [id][int16 LE]          id 1 = potenza solare in W
+#      func 0x07 riepilogo   [tipo<<5|indice][campo][ore uint16 LE][kWh uint32 LE]
+#                            tipo 1 giorno, 2 settimana, 3 mese, 4 anno, 5 totale
+#                            campo 0 = R1 + kWh solari, campo 1 = R2   (ripetuto ogni ~10 s)
+#                            indice: giorno = giorno della settimana (0 = lun), altrimenti 0 = corrente
+#                            totale R2 (A0 01 ...) mai visto: sensore lasciato in ascolto
+#    prog 0x0B func 0x01  "sono qui" ogni 60 s      func 0x08  centralina riavviata
+#  La centralina NON risponde a richieste: si legge solo cio' che trasmette da sola.
+# =============================================================================
+
+# ---------------- Nome del dispositivo ----------------
+substitutions:
+  nome: sorelmtdc
+  nome_amichevole: Sorel MTDC
+
+esphome:
+  name: ${nome}
+  friendly_name: ${nome_amichevole}
+  # All'avvio dell'ESP ripubblica gli ultimi valori noti (salvati nei globals qui sotto),
+  # cosi' in Home Assistant i sensori non restano "sconosciuti" finche' la centralina
+  # non rimanda i dati (fino a ~5 minuti per le temperature).
+  on_boot:
+    priority: -100
+    then:
+      # ripubblica gli ultimi valori noti finche' la centralina non manda quelli nuovi
+      - lambda: |-
+          if (!std::isnan(id(m_s1))) id(temp_s1).publish_state(id(m_s1));
+          if (!std::isnan(id(m_s2))) id(temp_s2).publish_state(id(m_s2));
+          if (!std::isnan(id(m_s3))) id(temp_s3).publish_state(id(m_s3));
+          if (!std::isnan(id(m_s4))) id(temp_s4).publish_state(id(m_s4));
+          if (!std::isnan(id(m_pot))) id(potenza_solare).publish_state(id(m_pot));
+          if (id(m_r1) >= 0) id(rele_r1).publish_state(id(m_r1) == 1);
+          if (id(m_r2) >= 0) id(rele_r2).publish_state(id(m_r2) == 1);
+          if (id(m_prog) != 0) {
+            std::string p;
+            for (int i = 0; i < 4; i++) { char c = (id(m_prog) >> (8 * i)) & 0xFF; if (c) p += c; }
+            id(programma).publish_state(p);
+          }
+          id(messaggio_centralina).publish_state("nessuno dall'avvio");
+
+# Wemos D1 mini: board: d1_mini (stessi pin D5-D8)
+esp8266:
+  board: nodemcuv2
+
+# INFO = log pulito (solo avvisi su riavvio centralina e messaggi).
+# DEBUG = mostra anche ogni riepilogo ricevuto (riga "RIEP ..."), utile per verifiche.
+logger:
+  level: INFO
+
+api:
+  encryption:
+    key: !secret api_key_sorelmtdc
+
+# OTA cifrato: richiede ESPHome >= 2026.9. Con versioni precedenti usare
+#   ota:
+#     - platform: esphome
+#       password: !secret ota_password
+ota:
+  - platform: esphome
+    encryption:
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  min_auth_mode: WPA2
+  power_save_mode: none
+  phy_mode: 11G
+  manual_ip:
+    static_ip: !secret ip_sorelmtdc
+    gateway: !secret network_gateway
+    subnet: !secret network_subnet
+  ap:
+    ssid: "Fallback ${nome}"
+    password: !secret wifi_password_fallback
+
+captive_portal:
+
+# Ora di Home Assistant: serve per il timestamp "Ultimo riavvio centralina"
+# e per sapere qual e' lo slot del giorno corrente nel riepilogo.
+time:
+  - platform: homeassistant
+    id: ha_time
+
+# Ultimi valori noti. Su ESP8266 restore_value usa la RAM RTC:
+# sopravvive a riavvio e OTA, non a una mancanza di corrente, e non consuma la flash.
+globals:
+  - id: ultimo_frame_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+  - id: m_s1
+    type: float
+    restore_value: true
+    initial_value: 'NAN'
+  - id: m_s2
+    type: float
+    restore_value: true
+    initial_value: 'NAN'
+  - id: m_s3
+    type: float
+    restore_value: true
+    initial_value: 'NAN'
+  - id: m_s4
+    type: float
+    restore_value: true
+    initial_value: 'NAN'
+  - id: m_pot
+    type: float
+    restore_value: true
+    initial_value: 'NAN'
+  - id: m_r1
+    type: int
+    restore_value: true
+    initial_value: '-1'
+  - id: m_r2
+    type: int
+    restore_value: true
+    initial_value: '-1'
+  - id: m_prog              # testo del programma (max 4 caratteri) impacchettato
+    type: uint32_t
+    restore_value: true
+    initial_value: '0'
+
+button:
+  - platform: restart
+    name: "Restart ${nome}"
+    entity_category: config
+
+# ---------------- SPI verso MCP2515 ----------------
+spi:
+  clk_pin: D5    # GPIO14 -> SCK
+  mosi_pin: D7   # GPIO13 -> SI
+  miso_pin: D6   # GPIO12 <- SO
+
+# ---------------- CAN bus ----------------
+canbus:
+  - platform: mcp2515
+    id: sorel_can
+    cs_pin: D8           # GPIO15 -> CS
+    clock: 8MHZ
+    bit_rate: 250KBPS
+    mode: NORMAL         # necessario per confermare (ACK) i frame della centralina
+    can_id: 0x1FFFFF00   # obbligatorio in ESPHome, non usato (non si trasmette)
+    use_extended_id: true
+
+    # Un solo trigger per TUTTI i frame (maschera 0): la lambda smista per prog/func.
+    on_frame:
+      - can_id: 0
+        can_id_mask: 0
+        use_extended_id: true
+        then:
+          - lambda: |-
+              const uint8_t prog = can_id & 0xFF;
+              const uint8_t func = (can_id >> 16) & 0xFF;
+              id(ultimo_frame_ms) = millis() | 1;     // qualsiasi frame = centralina viva
+
+              // pubblica solo se il valore cambia (la centralina ripete i riepiloghi ogni ~10 s)
+              auto pub = [](sensor::Sensor *s, float v) { if (s->state != v) s->publish_state(v); };
+
+              // ---------------- CONTROLLER ----------------
+              if (prog == 0x0B) {
+                if (func == 0x08) {                   // centralina riavviata
+                  ESP_LOGW("sorel", "Centralina riavviata");
+                  if (id(ha_time).now().is_valid())
+                    id(ultimo_riavvio).publish_state(id(ha_time).now().timestamp);
+                }
+                return;
+              }
+
+              // ---------------- DATALOGGER (tutti i dati utili) ----------------
+              if (prog != 0x80 || x.empty()) return;
+              const uint8_t sid = x[0];
+              const int16_t v16 = x.size() >= 3 ? (int16_t) (x[1] | (x[2] << 8)) : 0;
+
+              switch (func) {
+
+                case 0x01: {                          // SONDE
+                  if (x.size() < 3) return;
+                  bool invalid = (v16 >= 32000 || v16 <= -32000);
+                  float t = invalid ? NAN : v16 / 10.0f;
+                  switch (sid) {
+                    case 0: id(temp_s1).publish_state(t); id(m_s1) = t; break;
+                    case 1: id(temp_s2).publish_state(t); id(m_s2) = t; break;
+                    case 2: id(temp_s3).publish_state(t); id(m_s3) = t; break;
+                    case 3: id(temp_s4).publish_state(t); id(m_s4) = t; break;
+                  }
+                  return;
+                }
+
+                case 0x02: {                          // RELE'
+                  if (x.size() < 3) return;
+                  const uint8_t val = x[2];
+                  if (sid == 0) {
+                    id(rele_r1).publish_state(val > 0);
+                    id(m_r1) = val > 0 ? 1 : 0;
+                    // pompa ferma = potenza zero (di notte non resta "sconosciuta")
+                    if (val == 0 && id(potenza_solare).state != 0) {
+                      id(potenza_solare).publish_state(0);
+                      id(m_pot) = 0;
+                    }
+                  } else if (sid == 1) {
+                    id(rele_r2).publish_state(val > 0);
+                    id(m_r2) = val > 0 ? 1 : 0;
+                  } else if (sid == 2) {              // uscita PWM: velocita' pompa
+                    pub(id(velocita_pompa), roundf(val * 100.0f / 255.0f));
+                  }
+                  return;
+                }
+
+                case 0x03: {                          // PROGRAMMA (es. "S10")
+                  std::string p;
+                  uint32_t packed = 0;
+                  for (size_t i = 0; i < x.size() && i < 4; i++) {
+                    if (x[i] == 0) break;
+                    p += (char) x[i];
+                    packed |= (uint32_t) x[i] << (8 * i);
+                  }
+                  if (!p.empty() && id(programma).state != p) id(programma).publish_state(p);
+                  id(m_prog) = packed;
+                  return;
+                }
+
+                case 0x04: {                          // MESSAGGI (registro messaggi, menu 2.4)
+                  static uint8_t codice = 0;
+                  static std::string testo;
+                  if (x[0] == 0xFE) {                 // inizio testo
+                    testo.assign(x.begin() + 1, x.end());
+                  } else if (((can_id >> 24) & 0x18) == 0x08) {   // continuazione del testo
+                    testo.append(x.begin(), x.end());
+                  } else {                            // intestazione con il codice
+                    codice = x[0];
+                    testo.clear();
+                    return;
+                  }
+                  while (!testo.empty() && (testo.back() == 0 || testo.back() == ' ')) testo.pop_back();
+                  std::string msg = testo + " (codice " + std::to_string(codice) + ")";
+                  if (id(messaggio_centralina).state != msg) {
+                    id(messaggio_centralina).publish_state(msg);
+                    ESP_LOGW("sorel", "Messaggio centralina: %s", msg.c_str());
+                  }
+                  return;
+                }
+
+                case 0x06: {                          // STATISTICA
+                  if (sid == 1 && x.size() >= 3) {    // potenza solare in W
+                    id(potenza_solare).publish_state(v16 / 1000.0f);
+                    id(m_pot) = v16 / 1000.0f;
+                  }
+                  return;
+                }
+
+                case 0x07: {                          // RIEPILOGO ore / energia
+                  if (x.size() < 4) return;
+                  const uint8_t tipo = x[0] >> 5, idx = x[0] & 0x1F, campo = x[1];
+                  ESP_LOGD("sorel", "RIEP tipo=%u idx=%u campo=%u ore=%u kWh=%u", tipo, idx, campo,
+                           (unsigned) (x[2] | (x[3] << 8)),
+                           (unsigned) (x.size() >= 8 ? (x[4] | (x[5] << 8) | (x[6] << 16) | ((uint32_t) x[7] << 24)) : 0));
+                  // La centralina manda anche gli slot dei giorni/periodi passati:
+                  //  - giorno: idx = giorno della settimana (0 = lunedi' ... 6 = domenica) -> solo oggi
+                  //  - settimana / mese / anno / totale: idx 0 = periodo corrente
+                  if (tipo == 1) {
+                    auto now = id(ha_time).now();
+                    if (!now.is_valid()) return;                       // senza ora non so qual e' "oggi"
+                    const uint8_t oggi = (now.day_of_week + 5) % 7;    // ESPHome: 1 = domenica ... 7 = sabato
+                    if (idx != oggi) return;
+                  } else if (idx != 0) {
+                    return;
+                  }
+                  const uint16_t ore = x[2] | (x[3] << 8);
+                  const uint32_t kwh = x.size() >= 8
+                      ? (x[4] | (x[5] << 8) | (x[6] << 16) | ((uint32_t) x[7] << 24)) : 0;
+                  if (campo == 0) {
+                    if (tipo == 1) { pub(id(ore_r1_giorno), ore);    pub(id(energia_giorno), kwh); }
+                    if (tipo == 2) { pub(id(ore_r1_settimana), ore); pub(id(energia_settimana), kwh); }
+                    if (tipo == 3) { pub(id(ore_r1_mese), ore);      pub(id(energia_mese), kwh); }
+                    if (tipo == 4) { pub(id(ore_r1_anno), ore);      pub(id(energia_anno), kwh); }
+                    if (tipo == 5) { pub(id(ore_r1_totale), ore);    pub(id(energia_totale), kwh); }
+                  } else if (campo == 1) {
+                    if (tipo == 1) pub(id(ore_r2_giorno), ore);
+                    if (tipo == 2) pub(id(ore_r2_settimana), ore);
+                    if (tipo == 3) pub(id(ore_r2_mese), ore);
+                    if (tipo == 4) pub(id(ore_r2_anno), ore);
+                    if (tipo == 5) {                  // totale R2: finora MAI visto sul bus, resta in ascolto
+                      if (std::isnan(id(ore_r2_totale).state))
+                        ESP_LOGW("sorel", "Arrivato per la prima volta il totale ore R2: %u h", ore);
+                      pub(id(ore_r2_totale), ore);
+                    }
+                  }
+                  return;
+                }
+              }
+
+# ---------------- Sensori ----------------
+sensor:
+  # --- temperature ---
+  - platform: template
+    id: temp_s1
+    name: "S1 Temperatura"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: never
+
+  - platform: template
+    id: temp_s2
+    name: "S2 Temperatura"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: never
+
+  - platform: template
+    id: temp_s3
+    name: "S3 Temperatura"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: never
+
+  - platform: template
+    id: temp_s4
+    name: "S4 Temperatura"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: never
+
+  # --- solare ---
+  - platform: template
+    id: potenza_solare
+    name: "Potenza solare"
+    unit_of_measurement: "kW"
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 2
+    update_interval: never
+
+  - platform: template
+    id: velocita_pompa
+    name: "Velocità pompa solare"
+    unit_of_measurement: "%"
+    icon: mdi:pump
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: never
+
+  - platform: template
+    id: energia_giorno
+    name: "Energia solare oggi"
+    unit_of_measurement: "kWh"
+    device_class: energy
+    state_class: total_increasing
+    accuracy_decimals: 0
+    update_interval: never
+
+  - platform: template
+    id: energia_settimana
+    name: "Energia solare settimana"
+    unit_of_measurement: "kWh"
+    device_class: energy
+    state_class: total_increasing
+    accuracy_decimals: 0
+    update_interval: never
+
+  - platform: template
+    id: energia_mese
+    name: "Energia solare mese"
+    unit_of_measurement: "kWh"
+    device_class: energy
+    state_class: total_increasing
+    accuracy_decimals: 0
+    update_interval: never
+
+  - platform: template
+    id: energia_anno
+    name: "Energia solare anno"
+    unit_of_measurement: "kWh"
+    device_class: energy
+    state_class: total_increasing
+    accuracy_decimals: 0
+    update_interval: never
+
+  - platform: template
+    id: energia_totale            # da usare nella dashboard Energia di Home Assistant
+    name: "Energia solare totale"
+    unit_of_measurement: "kWh"
+    device_class: energy
+    state_class: total_increasing
+    accuracy_decimals: 0
+    update_interval: never
+
+  # --- ore di esercizio ---
+  - platform: template
+    id: ore_r1_giorno
+    name: "Ore R1 oggi"
+    unit_of_measurement: "h"
+    icon: mdi:timer-outline
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: never
+
+  - platform: template
+    id: ore_r1_settimana
+    name: "Ore R1 settimana"
+    unit_of_measurement: "h"
+    icon: mdi:timer-outline
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: never
+
+  - platform: template
+    id: ore_r1_mese
+    name: "Ore R1 mese"
+    unit_of_measurement: "h"
+    icon: mdi:timer-outline
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: never
+
+  - platform: template
+    id: ore_r1_anno
+    name: "Ore R1 anno"
+    unit_of_measurement: "h"
+    icon: mdi:timer-outline
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: never
+
+  - platform: template
+    id: ore_r1_totale
+    name: "Ore R1 totale"
+    unit_of_measurement: "h"
+    icon: mdi:timer-outline
+    state_class: total_increasing
+    accuracy_decimals: 0
+    update_interval: never
+
+  - platform: template
+    id: ore_r2_giorno
+    name: "Ore R2 oggi"
+    unit_of_measurement: "h"
+    icon: mdi:timer-outline
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: never
+
+  - platform: template
+    id: ore_r2_settimana
+    name: "Ore R2 settimana"
+    unit_of_measurement: "h"
+    icon: mdi:timer-outline
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: never
+
+  - platform: template
+    id: ore_r2_mese
+    name: "Ore R2 mese"
+    unit_of_measurement: "h"
+    icon: mdi:timer-outline
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: never
+
+  - platform: template
+    id: ore_r2_anno
+    name: "Ore R2 anno"
+    unit_of_measurement: "h"
+    icon: mdi:timer-outline
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: never
+
+  - platform: template
+    id: ore_r2_totale             # in ascolto di "A0 01 ...": finora la centralina non l'ha mai inviato
+    name: "Ore R2 totale"
+    unit_of_measurement: "h"
+    icon: mdi:timer-outline
+    state_class: total_increasing
+    accuracy_decimals: 0
+    update_interval: never
+
+  # --- diagnostica ---
+  - platform: template
+    id: ultimo_riavvio            # usato dall'automazione "conferma data e ora"
+    name: "Ultimo riavvio centralina"
+    device_class: timestamp
+    entity_category: diagnostic
+    update_interval: never
+
+  - platform: wifi_signal
+    name: "Wifi ${nome}"
+    update_interval: 60s
+    entity_category: diagnostic
+
+  - platform: uptime
+    name: "Uptime ${nome}"
+    update_interval: 60s
+    entity_category: diagnostic
+
+binary_sensor:
+  - platform: template
+    id: rele_r1
+    name: "Relè R1"
+
+  - platform: template
+    id: rele_r2
+    name: "Relè R2"
+
+  - platform: template
+    name: "Centralina online"
+    device_class: connectivity
+    entity_category: diagnostic
+    # la centralina trasmette di continuo: offline se tace per 3 minuti
+    lambda: |-
+      // differenza con segno: resta corretta anche se l'ultimo frame e' di 1 ms "nel futuro"
+      return id(ultimo_frame_ms) != 0 && (int32_t) (millis() - id(ultimo_frame_ms)) < 180000;
+
+  - platform: status
+    name: "Stato Connessione ${nome}"
+    device_class: connectivity
+    entity_category: diagnostic
+    disabled_by_default: false
+    update_interval: 300s
+
+text_sensor:
+  - platform: template
+    id: programma
+    name: "Programma"
+    icon: mdi:sitemap-outline
+    update_interval: never
+
+  - platform: template
+    id: messaggio_centralina
+    name: "Messaggio centralina"
+    icon: mdi:message-alert-outline
+    entity_category: diagnostic
+    update_interval: never
