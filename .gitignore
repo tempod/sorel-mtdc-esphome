@@ -1,0 +1,8 @@
+# ESPHome
+secrets.yaml
+.esphome/
+**/.esphome/
+*.bin
+# Varie
+.DS_Store
+Thumbs.db
